@@ -1,0 +1,414 @@
+import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import pandas as pd
+import time
+import h5py
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import keras
+from keras.utils import to_categorical
+from keras import models
+from keras import layers
+from keras import optimizers
+from keras import regularizers
+from keras.models import load_model, Model
+from keras.callbacks import TensorBoard
+from keras import backend as K
+from keras.utils import multi_gpu_model
+import os
+import cv2
+
+from keras.preprocessing.image import ImageDataGenerator, load_img
+from keras.layers import Input,Dense,Conv2D,MaxPooling2D,UpSampling2D,Dropout,Flatten, Activation
+from keras.layers import BatchNormalization,GlobalAveragePooling2D, AveragePooling2D,concatenate
+from keras.layers import ZeroPadding2D,add
+from keras.optimizers import SGD, Adam
+
+from sklearn import metrics
+
+
+
+
+def mkdir(path):
+    folder = os.path.exists(path)
+
+    if not folder:  # 判断是否存在文件夹如果不存在则创建为文件夹
+        os.makedirs(path)  # makedirs 创建文件时如果路径不存在会创建这个路径
+#
+# #读取图片
+def load_data(data_path):
+    class_names = []
+    data = []
+    labels = []
+    label_index = 0
+    data_new = []
+    label_new = []
+    for label_name in os.listdir(data_path):
+        # if os.path.splitext(label_name)[0] != 'Thumbs':
+        class_names.append(label_name)
+        for image_name in os.listdir(data_path + '/' + label_name):
+            image = cv2.imread(data_path + '/' + label_name +'/' + image_name)
+            if image is not None:
+                image = cv2.resize(image, (img_rows, img_cols), interpolation=cv2.INTER_LANCZOS4)
+                data.append(image)
+                labels.append(label_index)
+        label_index = label_index + 1
+    length_data = range(len(data))
+    labels = keras.utils.to_categorical(labels, len(class_names))
+    print('data:', np.array(data).shape, 'labels:', np.array(labels).shape, 'class_number:', len(class_names), 'class names:', str(class_names))
+    data = np.array(data)
+    # data = data.astype('float32')
+    return data, labels, len(class_names), class_names
+
+
+def get_classes(data_path):
+    class_names = []
+    for label_name in os.listdir(data_path):
+        if os.path.splitext(label_name)[0] != 'Thumbs':
+            class_names.append(label_name)
+    print('class_number:', len(class_names), 'class names:', str(class_names))
+    return len(class_names), class_names
+
+time_start = time.time()
+
+img_rows = 800
+img_cols = 800
+
+gpu = 4
+# hyperparameter
+keep_prob = 0.4
+learning_rate = 1e-4
+batch_size = 16
+epoch = 50
+r = 1e-1
+decay =1e-4
+momentum = 0.9
+
+
+# optimzier
+adam = optimizers.adam(lr=learning_rate)
+sgd = optimizers.SGD(lr=learning_rate, decay=decay, momentum=momentum, nesterov=True)
+
+
+log_path = 'semi-resnet-{}'.format(learning_rate)
+model_path = 'model/sq_resnet50_1600.h5'
+# data_path = "C:\\image_classification\\mission_3\\data_base_2000\\1"
+data_train = 'M:\\zeqi\\2000_cut_black\\train'
+data_val = 'M:\\zeqi\\2000_cut_black\\train'
+data_test = 'M:\\zeqi\\2000_cut_black\\train'
+path_image = 'M:\\zeqi\\full-size\\image_save\\full_resnet50_1600'+str(epoch)+'_drop'+str(keep_prob)+'_batch'+str(batch_size)+'_lr'+str(learning_rate)+'_r'+str(r)
+history_file = 'M:\\zeqi\\full-size\\history\\resnet50_epoch'+str(epoch)+'_drop'+str(keep_prob)+'_batch'+str(batch_size)+'_lr'+str(learning_rate)+'_r'+str(r)+'.h5'
+mkdir(path_image)
+
+nb_train_samples = 8261
+nb_validation_samples = 916
+nb_test_samples = 1018
+
+# x_train, y_train, length, class_names= load_data(data_train)
+# x_val, y_val, length_, class_names_= load_data(data_val)
+length, class_names = get_classes(data_test)
+
+
+# prepare data augmentation configuration
+# train_datagen = ImageDataGenerator(rescale=1. / 255, rotation_range =90, horizontal_flip=True)
+train_datagen = ImageDataGenerator(rescale=1. / 255)
+val_datagen = ImageDataGenerator(rescale=1. / 255)
+test_datagen = ImageDataGenerator(rescale=1. / 255)
+
+train_generator = train_datagen.flow_from_directory(
+    data_train,
+    target_size=(img_rows, img_cols),
+    batch_size=batch_size,
+    class_mode='categorical',
+    shuffle=True)
+
+validation_generator = val_datagen.flow_from_directory(
+    data_val,
+    target_size=(img_rows, img_cols),
+    batch_size=batch_size,
+    class_mode='categorical')
+
+test_generator = test_datagen.flow_from_directory(
+    data_test,
+    target_size=(img_rows, img_cols),
+    batch_size=batch_size,
+    class_mode='categorical',
+    shuffle = False)
+
+# 当channel_first(通道在前，channel* width*height)模式，BN层axis=1
+# 当channel_last(通道在后，width* height*channel)模式，BN层axis=3
+def Conv2d_BN(x, nb_filter, kernel_size, strides=(1, 1), padding='same', name=None):
+    if name is not None:
+        bn_name = name + '_bn'
+        conv_name = name + '_conv'
+    else:
+        bn_name = None
+        conv_name = None
+
+    x = BatchNormalization(axis=3, name=bn_name)(x)
+    x = Activation('relu')(x)
+    x = layers.Conv2D(nb_filter, kernel_size,kernel_initializer='he_normal',padding=padding, strides=strides, name=conv_name)(x)
+    return x
+
+
+def Conv_Block(inpt, nb_filter, kernel_size, strides=(1, 1), with_conv_shortcut=False):
+    x = Conv2d_BN(inpt, nb_filter=nb_filter[0], kernel_size=(1, 1), strides=strides, padding='same')
+    x = Conv2d_BN(x, nb_filter=nb_filter[1], kernel_size=(3, 3), padding='same')
+    x = Conv2d_BN(x, nb_filter=nb_filter[2], kernel_size=(1, 1), padding='same')
+    if with_conv_shortcut:
+        shortcut = Conv2d_BN(inpt, nb_filter=nb_filter[2], strides=strides, kernel_size=kernel_size)
+        x = add([x, shortcut])
+        return x
+    else:
+        x = add([x, inpt])
+        return x
+
+# orignal output （112，112，3）， conv1 stride 1
+inpt = Input(shape=(img_rows, img_cols, 3))
+# 0 stage
+x = ZeroPadding2D((3, 3))(inpt)
+# 1st stage, output: 56*56*64
+x = Conv2d_BN(x, nb_filter=64, kernel_size=(7, 7), strides=(2, 2), padding='valid')
+x = MaxPooling2D(pool_size=(3, 3), strides=(2, 2), padding='same')(x)
+# 2nd stage, output: 56*56*256
+x = Conv_Block(x, nb_filter=[64, 64, 256], kernel_size=(3, 3), strides=(1, 1), with_conv_shortcut=True)
+x = Conv_Block(x, nb_filter=[64, 64, 256], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[64, 64, 256], kernel_size=(3, 3))
+
+x = Conv_Block(x, nb_filter=[128, 128, 512], kernel_size=(3, 3), strides=(2, 2), with_conv_shortcut=True)
+x = Conv_Block(x, nb_filter=[128, 128, 512], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[128, 128, 512], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[128, 128, 512], kernel_size=(3, 3))
+
+x = Conv_Block(x, nb_filter=[256, 256, 1024], kernel_size=(3, 3), strides=(2, 2), with_conv_shortcut=True)
+x = Conv_Block(x, nb_filter=[256, 256, 1024], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[256, 256, 1024], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[256, 256, 1024], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[256, 256, 1024], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[256, 256, 1024], kernel_size=(3, 3))
+
+x = Conv_Block(x, nb_filter=[512, 512, 2048], kernel_size=(3, 3), strides=(2, 2), with_conv_shortcut=True)
+x = Conv_Block(x, nb_filter=[512, 512, 2048], kernel_size=(3, 3))
+x = Conv_Block(x, nb_filter=[512, 512, 2048], kernel_size=(3, 3))
+x = AveragePooling2D(pool_size=(7, 7))(x)
+x = Flatten()(x)
+x = Dropout(1-keep_prob)(x)
+x = Dense(4096, activation='relu', kernel_regularizer=regularizers.l2(r))(x)
+x = Dropout(1-keep_prob)(x)
+# Output Layer
+x = Dense(length, activation='softmax')(x)
+# x = Dropout(1-keep_prob)(x)
+model = Model(inputs=inpt, outputs=x)
+model.summary()
+model = multi_gpu_model(model, gpus=gpu)
+model.compile(loss='categorical_crossentropy', optimizer= adam, metrics=['accuracy'])
+
+
+# tensorborad
+tbCallBack = TensorBoard(log_dir= 'logs/{}'.format(log_path),  # log 目录
+                         histogram_freq=0,  # 按照何等频率（epoch）来计算直方图，0为不计算
+        #                batch_size=32,   # 用多大量的数据计算直方图
+                         write_graph=True,  # 是否存储网络结构图
+                         write_grads=True,  # 是否可视化梯度直方图
+                         write_images=True, # 是否可视化参数
+                         embeddings_freq=0,
+                         embeddings_layer_names=None,
+                         embeddings_metadata=None)
+
+
+history = model.fit_generator(
+        train_generator,
+        steps_per_epoch=nb_train_samples // batch_size,
+        epochs=epoch,
+        validation_data=validation_generator,
+        validation_steps= nb_validation_samples // batch_size,callbacks=[tbCallBack])
+
+# history = parallel_model.fit(x_train_, y_train_, epochs=epoch, batch_size=batch_size, validation_data=(x_val, y_val),callbacks=[tbCallBack])
+
+import matplotlib.pyplot as plt
+
+acc = history.history['acc']
+val_acc = history.history['val_acc']
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+
+
+#HDF5的写入：
+f = h5py.File(history_file,'w')
+# features is output  of the VGG16 conv-layers
+f['acc'] = acc
+f['val_acc'] = val_acc
+f['loss'] = loss
+f['val_loss'] = val_loss
+f.close()
+#
+f = h5py.File(history_file,'r')   #打开h5文件
+# 可以查看所有的主键
+for key in f.keys():
+    print(f[key].name)
+    print(f[key].shape)
+
+epochs = range(1, len(acc) + 1)
+
+plt.plot(epochs, acc, 'g', label='Training acc')
+plt.plot(epochs, val_acc, 'b', label='Validation acc')
+plt.title('Training and validation accuracy')
+plt.legend()
+fig_acc = plt.gcf()
+path_acc = path_image + '/acc.png'
+mkdir(path_image)
+fig_acc.savefig(path_acc,dpi=600)
+
+plt.figure()
+plt.plot(epochs, loss, 'g', label='Training loss')
+plt.plot(epochs, val_loss, 'b', label='Validation loss')
+plt.title('Training and validation loss')
+plt.legend()
+fig_loss = plt.gcf()
+path_loss = path_image + '/loss.png'
+fig_loss.savefig(path_loss,dpi=600)
+# plt.show()
+
+# load
+model = load_model(model_path)
+model.summary()
+test_loss, test_acc = model.evaluate_generator(test_generator, steps=round(nb_test_samples/batch_size))
+print('test_acc',test_acc,'test_loss',test_loss)
+
+
+
+time_end = time.time()
+print('time(min): ', (time_end - time_start)/60)
+dataframe = pd.DataFrame({'test_acc':test_acc,'test_loss': test_loss, 'time': (time_end - time_start)/60})
+dataframe.to_csv("resnet_test.csv", index=True, sep=',')
+
+# save
+model.save(model_path)   # HDF5 file, you have to pip3 install h5py if don't have it
+del model  # deletes the existing model
+
+# In every test we will clear the session and reload the model to force Learning_Phase values to change.
+print('DYNAMIC LEARNING_PHASE')
+K.clear_session()
+model = load_model(model_path)
+# This accuracy should match exactly the one of the validation set on the last iteration.
+print(model.evaluate_generator(test_generator))
+
+print('STATIC LEARNING_PHASE = 0')
+K.clear_session()
+K.set_learning_phase(0)
+model = load_model(model_path)
+# Again the accuracy should match the above.
+print(model.evaluate_generator(test_generator))
+
+print('STATIC LEARNING_PHASE = 1')
+K.clear_session()
+K.set_learning_phase(1)
+model = load_model(model_path)
+# The accuracy will be close to the one of the training set on the last iteration.
+print(model.evaluate_generator(test_generator))
+
+# load
+# model = load_model('model/vgg16_thumbs.h5')
+# print('test after load: ', model.predict(x_test[0:2]))
+# test_loss, test_acc = model.evaluate(x_test, y_test)
+# Results
+
+predictions = model.predict_generator(test_generator, steps=round(nb_test_samples/batch_size)).argmax(1)
+y_test = test_generator.classes
+print('predictions', predictions[0:20,])
+print('y_test', y_test[0:20,])
+print("Testing Accuracy: {}%".format(100*test_acc))
+print('loss:',test_loss)
+
+print("")
+print("Precision: {}%".format(100*metrics.precision_score(y_test, predictions, average="weighted")))
+print("Recall: {}%".format(100*metrics.recall_score(y_test, predictions, average="weighted")))
+print("f1_score: {}%".format(100*metrics.f1_score(y_test, predictions, average="weighted")))
+
+print("")
+print("Confusion Matrix:")
+confusion_matrix = metrics.confusion_matrix(y_test, predictions)
+print(confusion_matrix)
+normalised_confusion_matrix = np.array(confusion_matrix, dtype=np.float32)/np.sum(confusion_matrix)*100
+
+print("")
+print("Confusion matrix (normalised to % of total test data):")
+print(normalised_confusion_matrix)
+print("Note: training and testing data is not equally distributed amongst classes, ")
+print("so it is normal that more than a 6th of the data is correctly classifier in the last category.")
+
+def plot_confusion_matrix(y_true, y_pred, classes,
+                          normalize=False,
+                          title=None,
+                          cmap=plt.cm.Blues):
+    """
+    This function prints and plots the confusion matrix.
+    Normalization can be applied by setting `normalize=True`.
+    """
+    if not title:
+        if normalize:
+            title = 'Normalized confusion matrix'
+        else:
+            title = 'Confusion matrix, without normalization'
+
+    # Compute confusion matrix
+    cm = metrics.confusion_matrix(y_true, y_pred)
+    # Only use the labels that appear in the data
+    # classes = classes[unique_labels(y_true, y_pred)]
+
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        print("Normalized confusion matrix")
+    else:
+        print('Confusion matrix, without normalization')
+
+    print(cm)
+
+    fig, ax = plt.subplots()
+    im = ax.imshow(cm, interpolation='nearest', cmap=cmap)
+    ax.figure.colorbar(im, ax=ax)
+    # We want to show all ticks...
+    ax.set(xticks=np.arange(cm.shape[1]),
+           yticks=np.arange(cm.shape[0]),
+           # ... and label them with the respective list entries
+           xticklabels=classes, yticklabels=classes,
+           title=title,
+           ylabel='True label',
+           xlabel='Predicted label')
+
+    # Rotate the tick labels and set their alignment.
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right",
+             rotation_mode="anchor")
+
+    # Loop over data dimensions and create text annotations.
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    fig.tight_layout()
+    return ax
+
+
+np.set_printoptions(precision=2)
+
+# Plot non-normalized confusion matrix
+plot_confusion_matrix(y_test, predictions, classes=class_names, title='Confusion matrix, without normalization')
+fig_cm = plt.gcf()
+path_cm = path_image + '/cm.png'
+fig_cm.savefig(path_cm, dpi=600)
+plt.show()
+
+# Plot normalized confusion matrix
+plot_confusion_matrix(y_test, predictions, classes=class_names, normalize=True, title='Normalized confusion matrix')
+fig_cm_normal = plt.gcf()
+path_cm_normal = path_image + '/cm_normal.png'
+fig_cm_normal.savefig(path_cm_normal, dpi=600)
+plt.show()
+
+
+
+
